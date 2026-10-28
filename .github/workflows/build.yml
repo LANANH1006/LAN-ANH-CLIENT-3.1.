@@ -1,11 +1,8 @@
 name: Build LAN ANH CLIENT
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,23 +10,44 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Chuẩn bị source (tự giải nén zip nếu cần)
+      # Repo có thể để source ở gốc (có build.gradle) HOẶC để dạng file .zip.
+      - name: Locate Gradle project
+        id: src
         run: |
-          if [ -f build.gradle ]; then
-            echo "SRC=." >> "$GITHUB_ENV"
+          set -euo pipefail
+
+          if [ -f build.gradle ] && [ -f settings.gradle ]; then
+            DIR="."
           else
-            ZIP=$(ls *.zip | head -n1)
-            echo "Giải nén: $ZIP"
-            unzip -q "$ZIP" -d proj
-            GRADLE=$(find proj -maxdepth 3 -name build.gradle | head -n1)
-            test -n "$GRADLE"
-            echo "SRC=$(dirname "$GRADLE")" >> "$GITHUB_ENV"
+            found=""
+            for ZIP in *.zip; do
+              [ -e "$ZIP" ] || continue
+              echo "Thử giải nén: $ZIP"
+              rm -rf proj
+              mkdir proj
+              unzip -q "$ZIP" -d proj
+              BUILD_FILE="$(find proj -name build.gradle -print -quit)"
+              if [ -n "$BUILD_FILE" ]; then
+                found="$BUILD_FILE"
+                break
+              fi
+            done
+
+            if [ -z "$found" ]; then
+              echo "::error::Không tìm thấy build.gradle ở gốc repo hoặc trong file .zip nào"
+              exit 1
+            fi
+            DIR="$(dirname "$found")"
           fi
+
+          echo "Thư mục project: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
       - name: Setup Java 21
         uses: actions/setup-java@v4
@@ -42,23 +60,37 @@ jobs:
         with:
           gradle-version: '8.12'
 
-      - name: Kiểm tra file
-        working-directory: ${{ env.SRC }}
-        run: |
-          test -f build.gradle
-          test -f settings.gradle
-          test -f gradle.properties
-
       - name: Build mod
-        working-directory: ${{ env.SRC }}
+        working-directory: ${{ steps.src.outputs.dir }}
         run: gradle build --no-daemon
+
+      # Chỉ lấy jar release. Bỏ *-dev.jar (chưa remap, không chạy trong game) và *-sources.jar.
+      - name: Collect release jar
+        env:
+          PROJECT_DIR: ${{ steps.src.outputs.dir }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p release
+          copied=0
+          for jar in "$GITHUB_WORKSPACE/$PROJECT_DIR"/build/libs/*.jar; do
+            case "$(basename "$jar")" in
+              *-dev.jar|*-sources.jar) continue ;;
+            esac
+            cp "$jar" release/
+            copied=$((copied + 1))
+          done
+          if [ "$copied" -eq 0 ]; then
+            echo "::error::Không có jar release nào trong build/libs"
+            ls -la "$GITHUB_WORKSPACE/$PROJECT_DIR/build/libs" || true
+            exit 1
+          fi
+          ls -la release
 
       - name: Upload JAR
         uses: actions/upload-artifact@v4
         with:
           name: LanAnhClient-jar
-          path: |
-            ${{ env.SRC }}/build/libs/*.jar
-            !${{ env.SRC }}/build/libs/*-sources.jar
+          path: release/*.jar
           if-no-files-found: error
           retention-days: 14
